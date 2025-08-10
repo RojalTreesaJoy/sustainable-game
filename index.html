@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Polished 3D Lane Runner</title>
+<style>
+  :root { --ui-bg: rgba(0,0,0,0.5); --accent: #ffb400; }
+  body { margin:0; overflow:hidden; font-family: Inter, Arial, sans-serif; background:#000; -webkit-tap-highlight-color: transparent; }
+  #ui { position:fixed; left:16px; top:16px; z-index:20; color:#fff; display:flex; gap:12px; align-items:center;}
+  #score, #highscore { background:var(--ui-bg); padding:8px 12px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.5);}
+  #controls { position:fixed; right:16px; top:16px; z-index:20; display:flex; gap:8px; }
+  button.ui-btn { background:var(--ui-bg); border:0; color:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
+  #gameOverScreen { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:30; pointer-events:none; }
+  #gameOverInner { pointer-events:auto; background:linear-gradient(180deg, rgba(0,0,0,0.75), rgba(0,0,0,0.85)); color:white; padding:28px; border-radius:12px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,0.6); }
+  #gameOverInner h1 { margin:0 0 10px 0; font-size:36px; letter-spacing:2px;}
+  #gameOverInner p { margin:8px 0; }
+  canvas { display:block; }
+  /* tiny touch hint area at bottom */
+  #touchHint { position:fixed; bottom:10px; left:50%; transform:translateX(-50%); color:rgba(255,255,255,0.7); font-size:13px; z-index:15; background:rgba(0,0,0,0.35); padding:6px 10px; border-radius:999px; }
+</style>
+</head>
+<body>
+  <div id="ui">
+    <div id="score">Score: 0</div>
+    <div id="highscore">High: 0</div>
+  </div>
+  <div id="controls">
+    <button id="soundToggle" class="ui-btn">🔊 Sound</button>
+    <button id="pauseBtn" class="ui-btn">⏸ Pause</button>
+  </div>
+
+  <div id="gameOverScreen" style="display:none">
+    <div id="gameOverInner">
+      <h1>GAME OVER</h1>
+      <p id="finalScore">Score: 0</p>
+      <button id="restartBtn" class="ui-btn">Restart</button>
+    </div>
+  </div>
+
+  <div id="touchHint">Tap to jump • Swipe left/right to change lanes</div>
+
+  <!-- three.js and loader -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.164.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.164.0/examples/js/loaders/GLTFLoader.js"></script>
+
+<script>
+/* ---------------------------
+   Config & Globals
+   --------------------------- */
+const lanes = [-2.2, 0, 2.2];         // z positions for lanes
+let currentLaneIndex = 1;            // start center
+let targetLaneZ = lanes[currentLaneIndex]; // used for smooth movement
+let scene, camera, renderer, clock, mixer;
+let player = null;
+let coinModel = null;
+let obstacleModel = null;
+let coins = [], obstacles = [];
+let score = 0, highscore = 0;
+let gameOver = false;
+let isJumping = false, velocityY = 0;
+const gravity = -0.6;
+let spawnSpeedMultiplier = 1;  // scales up with time
+let baseSpeed = 0.06;          // forward motion speed for objects
+let speed = baseSpeed;
+let spawnTimers = { coin: 0, obstacle:0 };
+let soundEnabled = true;
+let paused = false;
+
+/* ---------------------------
+   UI references
+   --------------------------- */
+const scoreEl = document.getElementById('score');
+const highEl = document.getElementById('highscore');
+const gameOverScreen = document.getElementById('gameOverScreen');
+const finalScoreEl = document.getElementById('finalScore');
+const restartBtn = document.getElementById('restartBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const soundToggle = document.getElementById('soundToggle');
+
+/* ---------------------------
+   Audio (use user gesture to start if blocked)
+   --------------------------- */
+const bgMusic = new Audio('public/sound/bgSound.mp3');
+bgMusic.loop = true; bgMusic.volume = 0.35;
+const coinSound = new Audio('public/sound/CoinSound.mp3');
+const crashSound = new Audio('public/sound/crashSound.mp3');
+function tryPlayMusic() {
+  if (!soundEnabled) return;
+  bgMusic.play().catch(()=>{/* blocked until user gesture */});
+}
+
+/* ---------------------------
+   Three.js init
+   --------------------------- */
+async function init() {
+  // load highscore
+  highscore = parseInt(localStorage.getItem('laneRunnerHigh') || '0', 10);
+  highEl.innerText = 'High: ' + highscore;
+
+  // scene + camera + renderer
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x87CEEB); // fallback sky
+  camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+  camera.position.set(0, 2.8, 6.4);
+
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  // lights
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0); scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.9); dir.position.set(-5,10,-5); scene.add(dir);
+
+  // ground (textured, scrolls)
+  const groundTex = new THREE.TextureLoader().load('https://threejs.org/examples/textures/terrain/grasslight-big.jpg');
+  groundTex.wrapS = groundTex.wrapT = THREE.RepeatWrapping; groundTex.repeat.set(80,80);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(1200, 1200), new THREE.MeshStandardMaterial({ map: groundTex }));
+  ground.rotation.x = -Math.PI/2; ground.position.y = -0.01; scene.add(ground);
+  ground.userData = { tex: groundTex };
+
+  // sky sphere
+  const skyTex = new THREE.TextureLoader().load('https://threejs.org/examples/textures/2294472375_24a3b8ef46_o.jpg');
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(500,32,32), new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide }));
+  scene.add(sky);
+
+  // small ambient scene objects (distant parallax)
+  for (let i=0;i<40;i++){
+    const box = new THREE.Mesh(new THREE.BoxGeometry(1.2,1.2,1.2), new THREE.MeshStandardMaterial({color:0x2b8c2b}));
+    box.position.set((Math.random()-0.5)*60, Math.random()*1.5+0.1, -20 - Math.random()*80);
+    box.scale.setScalar(0.6+Math.random()*2);
+    scene.add(box);
+  }
+
+  // loader for gltf assets
+  const loader = new THREE.GLTFLoader();
+
+  // player (RobotExpressive with walk anim)
+  loader.load('https://threejs.org/examples/models/gltf/RobotExpressive/RobotExpressive.glb', (g) => {
+    player = g.scene;
+    player.scale.set(0.36,0.36,0.36);
+    player.position.set(0,0,lanes[currentLaneIndex]);
+    scene.add(player);
+    mixer = new THREE.AnimationMixer(player);
+    // choose a looping run/walk anim if present, fallback to any animation
+    let clip = THREE.AnimationClip.findByName(g.animations, 'Run') || THREE.AnimationClip.findByName(g.animations,'Walk') || g.animations[0];
+    if (clip) mixer.clipAction(clip).play();
+  });
+
+  // coin model (Khronos sample)
+  loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Coin/glTF-Binary/Coin.glb', (g)=> {
+    coinModel = g.scene; coinModel.scale.set(0.5,0.5,0.5);
+  });
+
+  // obstacle (Barrel sample)
+  loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Barrel/glTF-Binary/Barrel.glb', (g)=> {
+    obstacleModel = g.scene; obstacleModel.scale.set(0.45,0.45,0.45);
+  });
+
+  // clock
+  clock = new THREE.Clock();
+
+  // input
+  addInputHandlers();
+
+  // start music attempt
+  tryPlayMusic();
+
+  // begin game loop
+  animate();
+}
+
+/* ---------------------------
+   Utility: spawn coin / obstacle
+   --------------------------- */
+function spawnCoin() {
+  if (!coinModel || gameOver) return;
+  const c = coinModel.clone();
+  // place ahead (x positive) and random lane
+  const lane = lanes[Math.floor(Math.random()*lanes.length)];
+  c.position.set(9 + Math.random()*6, 0.6 + Math.random()*0.8, lane);
+  // gentle spin
+  c.userData = { spinSpeed: 0.05 + Math.random()*0.12 };
+  scene.add(c); coins.push(c);
+}
+
+function spawnObstacle() {
+  if (!obstacleModel || gameOver) return;
+  const o = obstacleModel.clone();
+  const lane = lanes[Math.floor(Math.random()*lanes.length)];
+  o.position.set(9 + Math.random()*6, 0, lane);
+  // random scale + small bob
+  const s = 0.45 + Math.random()*0.25; o.scale.set(s,s,s);
+  o.userData = { bob: Math.random()*0.5 };
+  scene.add(o); obstacles.push(o);
+}
+
+/* ---------------------------
+   Collision helpers
+   --------------------------- */
+function checkCollision(objA, objB, threshold) {
+  return objA.position.distanceTo(objB.position) < threshold;
+}
+
+/* ---------------------------
+   Game loop
+   --------------------------- */
+function animate(){
+  requestAnimationFrame(animate);
+  if (!clock) return;
+  if (paused) { clock.getDelta(); renderer.render(scene, camera); return; }
+
+  const dt = clock.getDelta();
+
+  // increase difficulty gradually
+  spawnSpeedMultiplier += dt * 0.01;
+  speed = baseSpeed + spawnSpeedMultiplier * 0.01;
+
+  // spawn timers (coin frequency and obstacles)
+  spawnTimers.coin -= dt;
+  spawnTimers.obstacle -= dt;
+  const coinInterval = Math.max(0.6, 1.6 - spawnSpeedMultiplier*0.08);  // faster spawn over time
+  const obsInterval = Math.max(0.9, 2.3 - spawnSpeedMultiplier*0.08);
+  if (spawnTimers.coin <= 0) { spawnCoin(); spawnTimers.coin = coinInterval; }
+  if (spawnTimers.obstacle <= 0) { spawnObstacle(); spawnTimers.obstacle = obsInterval; }
+
+  // update mixer animations
+  if (mixer) mixer.update(dt);
+
+  // player smooth lane move
+  if (player) {
+    const z = targetLaneZ;
+    player.position.z += (z - player.position.z) * Math.min(12*dt, 1); // smooth lerp with rate
+    // small bob when running
+    player.position.y += (player.position.y - player.position.y) * 0; // placeholder
+    // apply jump physics
+    player.position.y += velocityY * dt * 10;
+    velocityY += gravity * dt * 10;
+    if (player.position.y < 0) { player.position.y = 0; velocityY = 0; isJumping = false; }
+  }
+
+  // move coins & check collect
+  for (let i = coins.length-1; i>=0; i--){
+    const c = coins[i];
+    c.position.x -= speed * 100 * dt; // movement speed scaled
+    // spin coin
+    c.rotation.y += (c.userData.spinSpeed || 0.06);
+    // simple up-down
+    c.position.y = 0.6 + Math.sin((Date.now()*0.002) + i)*0.12;
+    // collect if near player
+    if (player && checkCollision(c, player, 0.8)) {
+      // collect
+      scene.remove(c); coins.splice(i,1);
+      score += 1;
+      scoreEl.innerText = 'Score: ' + score;
+      if (soundEnabled) { coinSound.currentTime = 0; coinSound.play().catch(()=>{}); }
+      continue;
+    }
+    if (c.position.x < -12) { scene.remove(c); coins.splice(i,1); }
+  }
+
+  // move obstacles & collisions
+  for (let i = obstacles.length-1; i>=0; i--){
+    const o = obstacles[i];
+    o.position.x -= speed * 100 * dt;
+    // slight bob
+    o.position.y = 0 + Math.abs(Math.sin((Date.now()*0.001)+o.userData.bob))*0.04;
+    if (player && checkCollision(o, player, 1.0)) {
+      // hit -> game over
+      if (!gameOver) {
+        triggerGameOver();
+      }
+      break;
+    }
+    if (o.position.x < -12) { scene.remove(o); obstacles.splice(i,1); }
+  }
+
+  // scroll ground texture
+  scene.traverse((n)=>{
+    if (n.userData && n.userData.tex) {
+      n.userData.tex.offset.x -= speed*0.003;
+    }
+  });
+
+  // rotate sky slowly for parallax
+  scene.rotation.y += dt * 0.002;
+
+  // camera follow (smooth)
+  if (player) {
+    const desiredX = player.position.x - 0.6;
+    camera.position.x += (desiredX - camera.position.x) * Math.min(6*dt, 1);
+    const desiredZ = player.position.z + 6.4; // keep behind
+    camera.position.z += (desiredZ - camera.position.z) * Math.min(6*dt, 1);
+    camera.lookAt(player.position.x + 2, player.position.y + 1.2, player.position.z);
+  }
+
+  // render
+  renderer.render(scene, camera);
+}
+
+/* ---------------------------
+   Game Over & Reset
+   --------------------------- */
+function triggerGameOver() {
+  gameOver = true;
+  paused = true;
+  gameOverScreen.style.display = 'flex';
+  finalScoreEl.innerText = 'Score: ' + score;
+  if (soundEnabled) { crashSound.play().catch(()=>{}); }
+  // update highscore
+  if (score > highscore) {
+    highscore = score; localStorage.setItem('laneRunnerHigh', String(highscore));
+    highEl.innerText = 'High: ' + highscore;
+  }
+}
+
+function resetGame() {
+  // clear objects
+  coins.forEach(c=>scene.remove(c)); coins=[]; obstacles.forEach(o=>scene.remove(o)); obstacles=[];
+  score = 0; scoreEl.innerText = 'Score: 0';
+  spawnSpeedMultiplier = 1; speed = baseSpeed;
+  gameOver = false; paused = false;
+  currentLaneIndex = 1; targetLaneZ = lanes[currentLaneIndex];
+  if (player) { player.position.set(0,0,targetLaneZ); }
+  gameOverScreen.style.display = 'none';
+  tryPlayMusic();
+}
+
+/* ---------------------------
+   Controls (keyboard + touch)
+   --------------------------- */
+function addInputHandlers() {
+  // keyboard
+  window.addEventListener('keydown', (e)=>{
+    if (gameOver && e.code === 'Space') { resetGame(); return; }
+    if (e.code === 'ArrowLeft') { moveLeft(); }
+    if (e.code === 'ArrowRight') { moveRight(); }
+    if (e.code === 'Space') { jump(); }
+    if (e.code === 'KeyP') togglePause();
+  });
+
+  // buttons
+  restartBtn.addEventListener('click', resetGame);
+  pauseBtn.addEventListener('click', togglePause);
+  soundToggle.addEventListener('click', ()=> {
+    soundEnabled = !soundEnabled;
+    soundToggle.innerText = soundEnabled ? '🔊 Sound' : '🔈 Muted';
+    if (!soundEnabled) { bgMusic.pause(); } else { tryPlayMusic(); }
+  });
+
+  // simple swipe detection for mobile
+  let touchStartX = null, touchStartY = null, touchStartT = 0;
+  window.addEventListener('touchstart', (e)=>{
+    const t = e.touches[0];
+    touchStartX = t.clientX; touchStartY = t.clientY; touchStartT = Date.now();
+    // also try to start audio on first gesture
+    tryPlayMusic();
+  }, {passive:true});
+  window.addEventListener('touchend', (e)=>{
+    if (!touchStartX) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - touchStartX, dy = t.clientY - touchStartY;
+    const dt = Date.now() - touchStartT;
+    // vertical tap -> jump (short tap)
+    if (Math.abs(dx) < 30 && Math.abs(dy) < 30 && dt < 300) { jump(); }
+    // swipe left/right
+    if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 40) {
+      if (dx < 0) moveLeft(); else moveRight();
+    }
+    touchStartX = null;
+  }, {passive:true});
+}
+
+/* ---------------------------
+   Input actions
+   --------------------------- */
+function moveLeft(){
+  if (gameOver || paused) return;
+  if (currentLaneIndex > 0) {
+    currentLaneIndex--; targetLaneZ = lanes[currentLaneIndex];
+  }
+}
+function moveRight(){
+  if (gameOver || paused) return;
+  if (currentLaneIndex < lanes.length-1) {
+    currentLaneIndex++; targetLaneZ = lanes[currentLaneIndex];
+  }
+}
+function jump(){
+  if (gameOver || paused) return;
+  if (!isJumping && player) { velocityY = 0.18; isJumping = true; }
+}
+function togglePause(){
+  if (gameOver) return;
+  paused = !paused;
+  pauseBtn.innerText = paused ? '▶ Resume' : '⏸ Pause';
+  if (!paused) { clock.getDelta(); } // reset clock drift
+}
+
+/* ---------------------------
+   Start everything
+   --------------------------- */
+init();
+
+/* Notes:
+ - If audio doesn't start automatically in some browsers, tap/click the screen once to grant audio permission.
+ - You can replace GLB urls and textures with your own hosted assets.
+ - Performance: for low-end mobile reduce model detail or lower renderer pixel ratio.
+*/
+</script>
+</body>
+</html>
